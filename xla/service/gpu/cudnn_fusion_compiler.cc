@@ -22,6 +22,7 @@ limitations under the License.
 #include <string>
 #include <utility>
 #include <vector>
+#include <cuda_fp16.h>
 
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
@@ -173,7 +174,7 @@ int FusionLevel(const HloInstruction& hlo) {
 class GemmDimensionAdapter {
   explicit GemmDimensionAdapter(const HloDotInstruction& dot,
                                 TritonFusionAnalysis analysis)
-      : analysis_(std::move(analysis)), dot_(dot) {};
+      : analysis_(std::move(analysis)), dot_(dot){};
 
  public:
   const TritonFusionAnalysis analysis_;
@@ -311,6 +312,40 @@ class GemmDimensionAdapter {
   const HloDotInstruction& dot_;
 };
 
+std::optional<std::shared_ptr<graph::Tensor_attributes>>
+HandleConstantHloToCudnnGraph(const HloInstruction* hlo, graph::Graph& graph) {
+  CHECK(hlo->IsConstant()) << "HLO is not a constant: " << hlo->ToShortString();
+  if (!ShapeUtil::IsScalar(hlo->shape())) {
+    VLOG(3) << "Currently only support fusing scalar in the graph";
+    return std::nullopt;
+  }
+  PrimitiveType constant_type = hlo->shape().element_type();
+  switch (constant_type) {
+    case BF16:
+      return graph.tensor(__nv_bfloat16(
+          hlo->literal()
+              .data<primitive_util::PrimitiveTypeToNative<BF16>::type>()[0]));
+    case F32:
+      return graph.tensor(
+          hlo->literal()
+              .data<primitive_util::PrimitiveTypeToNative<F32>::type>()[0]);
+    case S32:
+      return graph.tensor(
+          hlo->literal()
+              .data<primitive_util::PrimitiveTypeToNative<S32>::type>()[0]);
+    // Enable F16 case once cuDNN F16 numerical issue is resolved:
+    // https://nvbugspro.nvidia.com/bug/4508897 
+    // case F16:
+    //   return graph.tensor(__half(
+    //       hlo->literal()
+    //           .data<primitive_util::PrimitiveTypeToNative<F16>::type>()[0]));
+    default:
+      VLOG(3) << "Unsupported constant type: "
+              << PrimitiveType_Name(constant_type);
+      return std::nullopt;
+  }
+}
+
 // Traverses fusion computations and creates cuDNN graphs out of them.
 absl::StatusOr<std::optional<se::gpu::CudnnGraph>> HloFusionToCuDnnGraph(
     const HloFusionInstruction& fusion) {
@@ -371,6 +406,14 @@ absl::StatusOr<std::optional<se::gpu::CudnnGraph>> HloFusionToCuDnnGraph(
     if (hlo->opcode() == HloOpcode::kParameter) {
       CHECK(hlo_to_cudnn.contains(hlo));
       continue;
+    } else if (FusionLevel(fusion) >= 2 &&
+               hlo->opcode() == HloOpcode::kConstant) {
+      if (const auto const_tensor = HandleConstantHloToCudnnGraph(hlo, graph);
+          const_tensor.has_value()) {
+        hlo_to_cudnn[hlo] = const_tensor.value();
+      } else {
+        return std::nullopt;
+      }
     } else if (hlo->opcode() == HloOpcode::kReshape ||
                hlo->opcode() == HloOpcode::kBitcast ||
                hlo->opcode() == HloOpcode::kTranspose ||
@@ -395,6 +438,21 @@ absl::StatusOr<std::optional<se::gpu::CudnnGraph>> HloFusionToCuDnnGraph(
                              .set_compute_data_type(compute_dtype.value());
       if (hlo->operand_count() == 1) {
         hlo_to_cudnn[hlo] = graph.pointwise(operand(0), attrs);
+        // Sets the dimensions for IDENTITY ops for cuDNN FE to infer its
+        // inputs' shapes.
+        if (mode.value() == fe::PointwiseMode_t::IDENTITY) {
+          const auto scope = adapter->analysis_.QueryInstructionScope(hlo);
+          std::vector<int64_t> dimensions;
+          std::vector<int64_t> strides;
+          if (!scope.has_value() ||
+              !adapter->DimensionsAndStrides(*hlo, scope.value(), dimensions,
+                                             strides)) {
+            VLOG(3) << "Unsupported hlo for querying dimensions: "
+                    << hlo->ToShortString();
+          } else {
+            hlo_to_cudnn[hlo]->set_dim(dimensions);
+          }
+        }
       } else if (hlo->operand_count() == 2) {
         hlo_to_cudnn[hlo] = graph.pointwise(operand(0), operand(1), attrs);
       } else if (hlo->operand_count() == 3) {

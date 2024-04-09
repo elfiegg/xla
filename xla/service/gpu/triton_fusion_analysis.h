@@ -79,6 +79,10 @@ class TritonFusionAnalysis {
     return parameters_.at(scope);
   }
 
+  // Returns the given instruction's scope. Returns nullopt if no scope is
+  // found.
+  std::optional<Scope> QueryInstructionScope(const HloInstruction* hlo) const;
+
   std::string ToString() const;
 
  private:

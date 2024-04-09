@@ -36,13 +36,19 @@ def _tf_repositories():
     #    curl -L <url> | sha256sum
     # and update the sha256 with the result.
 
-    tf_http_archive(
+    # tf_http_archive(
+    #     name = "cudnn_frontend_archive",
+    #     build_file = "//third_party:cudnn_frontend.BUILD",
+    #     patch_file = ["//third_party:cudnn_frontend_header_fix.patch"],
+    #     sha256 = "1bb309af98fe9aad81b6a14fd52acbd6566aacfd322fc5803f9a1b77fc681a27",
+    #     strip_prefix = "cudnn-frontend-1.2.1",
+    #     urls = tf_mirror_urls("https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.2.1.zip"),
+    # )
+
+    native.new_local_repository(
         name = "cudnn_frontend_archive",
         build_file = "//third_party:cudnn_frontend.BUILD",
-        patch_file = ["//third_party:cudnn_frontend_header_fix.patch"],
-        sha256 = "1bb309af98fe9aad81b6a14fd52acbd6566aacfd322fc5803f9a1b77fc681a27",
-        strip_prefix = "cudnn-frontend-1.2.1",
-        urls = tf_mirror_urls("https://github.com/NVIDIA/cudnn-frontend/archive/refs/tags/v1.2.1.zip"),
+        path = "./cudnn_frontend",
     )
 
     tf_http_archive(
