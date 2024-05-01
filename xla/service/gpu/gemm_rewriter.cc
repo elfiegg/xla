@@ -612,7 +612,31 @@ class GemmRewriterVisitor : public DfsHloRewriteVisitor {
   }
 
   absl::Status HandleMultiply(HloInstruction *instr) override {
-    HloInstruction *alpha, *existing_gemm;
+    HloInstruction *a_scale, *b_scale, *existing_gemm;
+    if (Match(instr,
+              m::MultiplyAnyOrder(
+                  m::MultiplyAnyOrder(
+                      CublasLtMatmulMaybeF8(&existing_gemm).WithOneUser(),
+                      m::Broadcast(m::Op(&a_scale)).WithOneUser()),
+                  m::Broadcast(m::Op(&b_scale)).WithOneUser()))) {
+      std::vector<HloInstruction *> operands(existing_gemm->operands().begin(),
+                                             existing_gemm->operands().end());
+      // Skip bias input matrix C if it exists.
+      int a_scale_idx = operands[2]->IsConstant() ? 2 : 3;
+      operands[a_scale_idx] = a_scale;
+      operands[a_scale_idx + 1] = b_scale;
+      TF_ASSIGN_OR_RETURN(auto gpu_config,
+                          existing_gemm->backend_config<GpuBackendConfig>());
+      GemmBackendConfig &config = *gpu_config.mutable_gemm_backend_config();
+      std::unique_ptr<HloInstruction> result =
+          existing_gemm->CloneWithNewOperands(instr->shape(), operands);
+      TF_RETURN_IF_ERROR(result->set_backend_config(gpu_config));
+      TF_RETURN_IF_ERROR(SetName(result->GetModule(), result.get()));
+      VLOG(3) << "Fused scaling factors: " << result->ToString();
+      TF_RETURN_IF_ERROR(ReplaceWithNewInstruction(instr, std::move(result)));
+    }
+
+    HloInstruction *alpha;
     if (Match(instr,
               m::MultiplyAnyOrder(
                   GemmOrCublasLtMatmulMaybeF8(&existing_gemm).WithOneUser(),
